@@ -238,15 +238,43 @@ def load_posted(cfg: Config) -> dict:
 def save_posted(cfg: Config, posted: dict) -> bool:
     """写台账，**返回是否真写成功**。⛔ 别把异常静默吞掉：
     吞掉之后日志说「已记录」、盘上是空的，下一轮就重投一遍。"""
-    p = posted_path(cfg)
+    return _save_json(posted_path(cfg), posted)
+
+
+def _save_json(p: Path, value: dict) -> bool:
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(json.dumps(posted, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(p)
         return True
     except OSError:
         return False
+
+
+def progress_path(cfg: Config) -> Path:
+    return posted_path(cfg).with_name(".post-progress.json")
+
+
+def load_progress(cfg: Config) -> dict:
+    try:
+        progress = json.loads(progress_path(cfg).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"读不了逐端投递记录，停止以免重投：{e}") from e
+    if not isinstance(progress, dict) or any(
+        not isinstance(entry, dict) or not isinstance(entry.get("md5"), str)
+        or not isinstance(entry.get("targets"), dict)
+        or any(not isinstance(receipt, dict) for receipt in entry["targets"].values())
+        for entry in progress.values()
+    ):
+        raise RuntimeError("逐端投递记录格式不正确，停止以免重投")
+    return progress
+
+
+def save_progress(cfg: Config, progress: dict) -> bool:
+    return _save_json(progress_path(cfg), progress)
 
 
 def already_posted(cfg: Config, posted: dict, f: Path) -> tuple[bool, str]:
@@ -296,12 +324,13 @@ def list_outbox(cfg: Config) -> list[Path]:
     )
 
 
-def deliver(cfg: Config, dev_key: str, local: Path) -> dict:
+def deliver(cfg: Config, dev_key: str, local: Path, *, data: bytes | None = None) -> dict:
     """把一件投到 `dev_key` 的收件箱。校验 md5，对不上不算成功。"""
     dev = cfg.device(dev_key)
     host = cfg.host(dev_key)
     try:
-        data = local.read_bytes()
+        if data is None:
+            data = local.read_bytes()
     except OSError as e:
         return {"ok": False, "why": f"读不了原件：{e}", "md5": "", "verified": False}
     digest = md5_bytes(data)
@@ -315,7 +344,7 @@ def deliver(cfg: Config, dev_key: str, local: Path) -> dict:
         return {"ok": True, "why": "OK（未校验）", "md5": digest, "verified": False}
     got = host.digest(dest)
     if not got:
-        return {"ok": True, "why": "写入成功，但取不到对端 md5（未验成）",
+        return {"ok": False, "why": "写入成功，但取不到要求校验的对端 md5（未验成）",
                 "md5": digest, "verified": False}
     if got != digest:
         return {"ok": False, "why": f"md5 不一致（要 {digest}，对端 {got}）",
@@ -323,13 +352,52 @@ def deliver(cfg: Config, dev_key: str, local: Path) -> dict:
     return {"ok": True, "why": "OK", "md5": digest, "verified": True}
 
 
-def archive(cfg: Config, local: Path, digest: str = "") -> bool:
+def deliver_targets(cfg: Config, local: Path, targets: list[str]) -> tuple[bytes, str, dict]:
+    """Freeze one payload and durably record each successful endpoint before continuing.
+
+    Callers hold PostLock. A consumed destination is not evidence of failure;
+    retries rely on the saved receipt rather than rewriting a missing inbox file.
+    """
+    data = local.read_bytes()
+    digest = md5_bytes(data)
+    progress = load_progress(cfg)
+    key = str(local.resolve())
+    entry = progress.get(key, {})
+    if entry.get("md5") != digest:
+        entry = {"md5": digest, "targets": {}}
+    results = {}
+    for target in dict.fromkeys(targets):
+        dev = cfg.device(target)
+        host = cfg.host(target)
+        endpoint = {"inbox": str(dev.inbox), "transport": cfg.transport,
+                    "aliases": [] if host.local else list(dev.aliases)}
+        receipt = entry["targets"].get(target, {})
+        if receipt.get("endpoint") == endpoint and (receipt.get("verified") or not cfg.post.verify):
+            results[target] = {"ok": True, "why": "沿用已落盘的逐端成功记录",
+                               "md5": digest, "verified": receipt.get("verified", False),
+                               "cached": True}
+            continue
+        result = deliver(cfg, target, local, data=data)
+        results[target] = result
+        if result["ok"]:
+            entry["targets"][target] = {"endpoint": endpoint, "verified": result["verified"]}
+            progress[key] = entry
+            if not save_progress(cfg, progress):
+                results[target] = {**result, "ok": False,
+                                   "why": "已写入，但逐端记录无法落盘；停止后续投递，下轮可能重投"}
+                break
+    return data, digest, results
+
+
+def archive(cfg: Config, local: Path, digest: str = "", *, data: bytes | None = None) -> bool:
     """投成功后**复制**一份到 已发/ 做记录，原件留在发件箱。"""
     sent = Path(str(cfg.device().sent_dir))
     try:
         sent.mkdir(parents=True, exist_ok=True)
         dest = sent / local.name
-        if not dest.exists():
+        if data is not None:
+            cfg.host(cfg.me).write_bytes(dest, data)
+        elif not dest.exists():
             shutil.copy2(local, dest)
     except OSError:
         return False
@@ -381,6 +449,13 @@ def post_once(cfg: Config, dry: bool = False) -> dict:
     """投一轮。返回统计（也供 `--self-test` 断言）。"""
     stats = {"candidates": 0, "delivered": 0, "skipped": 0, "blocked": 0,
              "failed": 0, "targets": {}, "errors": []}
+    if not dry:
+        try:
+            load_progress(cfg)
+        except RuntimeError as e:
+            stats["failed"] = 1
+            stats["errors"].append(str(e))
+            return stats
     posted = load_posted(cfg)
     for f in list_outbox(cfg):
         ok, reasons = validate_name_all(cfg, f.name)
@@ -403,12 +478,21 @@ def post_once(cfg: Config, dry: bool = False) -> dict:
             print(line)
             stats["errors"].append(line)
             continue
-        all_ok = True
-        for t in targets:
-            r = deliver(cfg, t, f)
-            stats["targets"][t] = stats["targets"].get(t, 0) + (1 if r["ok"] else 0)
+        try:
+            data, digest, results = deliver_targets(cfg, f, targets)
+        except RuntimeError as e:
+            stats["failed"] += 1
+            stats["errors"].append(str(e))
+            return stats
+        except OSError as e:
+            stats["failed"] += 1
+            stats["errors"].append(f"{f.name}：读不了原件：{e}")
+            continue
+        all_ok = len(results) == len(set(targets))
+        for t, r in results.items():
+            stats["targets"][t] = stats["targets"].get(t, 0) + (1 if r["ok"] and not r.get("cached") else 0)
             if r["ok"]:
-                log_line(cfg, f"投出 → {t}  {f.name}"
+                log_line(cfg, f"{'已投跳过' if r.get('cached') else '投出'} → {t}  {f.name}"
                               + ("" if r["verified"] else f"（{r['why']}）"))
             else:
                 all_ok = False
@@ -416,11 +500,21 @@ def post_once(cfg: Config, dry: bool = False) -> dict:
                 log_line(cfg, f"失败 → {t}  {f.name}：{r['why']}")
                 stats["errors"].append(f"{f.name} → {t}：{r['why']}")
         if all_ok:
+            try:
+                unchanged = f.read_bytes() == data
+            except OSError:
+                unchanged = False
+            if not unchanged:
+                stats["failed"] += 1
+                stats["errors"].append(f"{f.name}：投递中原件变化；本轮各端仍为同一快照，下轮按新内容投递")
+                continue
             stats["delivered"] += 1
-            if not archive(cfg, f, md5_file(f)):
-                # 记不上账 = 下一轮重投；这比「少一份留档」更贵，所以要喊出来。
+            if not archive(cfg, f, digest, data=data):
+                stats["failed"] += 1
                 log_line(cfg, f"[!] 已投但记账失败：{f.name}")
-                stats["errors"].append(f"{f.name}：已投但 .posted.json 写不进去（下轮会重投）")
+                stats["errors"].append(f"{f.name}：已投但归档/完成台账失败；逐端成功记录保留，下轮重试收尾")
+            else:
+                posted[f.name] = digest
     return stats
 
 
@@ -514,17 +608,29 @@ def send_one(cfg: Config, f: Path, explicit: list[str] | None, dry: bool) -> int
     if bad:
         print(f"[X] 不认识的设备：{'、'.join(bad)}", file=sys.stderr)
         return 2
-    for t in targets:
-        if dry:
+    if dry:
+        for t in targets:
             print(f"（空跑）将投：{f.name} → {t}")
-            continue
-        r = deliver(cfg, t, f)
-        print(("[OK] " if r["ok"] else "[X] ") + f"{f.name} → {t}：{r['why']}")
-        if not r["ok"]:
-            return 1
-        log_line(cfg, f"手工投出 → {t}  {f.name}")
-    if not dry and not archive(cfg, f):
-        print("[!] 已投但 .posted.json 写不进去（下轮会重投）", file=sys.stderr)
+        return 0
+    try:
+        with PostLock(lock_path(cfg)):
+            data, digest, results = deliver_targets(cfg, f, targets)
+            for t, r in results.items():
+                print(("[OK] " if r["ok"] else "[X] ") + f"{f.name} → {t}：{r['why']}")
+                log_line(cfg, f"手工投递 → {t}  {f.name}：{r['why']}")
+            if len(results) != len(set(targets)) or not all(r["ok"] for r in results.values()):
+                return 1
+            if f.read_bytes() != data:
+                print("[!] 投递中原件变化；本轮各端收到同一快照，请按新内容重试", file=sys.stderr)
+                return 1
+            if not archive(cfg, f, digest, data=data):
+                print("[!] 已投但归档/完成台账失败；逐端记录保留，请重试收尾", file=sys.stderr)
+                return 1
+    except AlreadyRunning:
+        print("[!] 已有投递在跑，请稍后重试", file=sys.stderr)
+        return 1
+    except (OSError, RuntimeError) as e:
+        print(f"[X] {e}", file=sys.stderr)
         return 1
     return 0
 

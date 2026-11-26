@@ -29,6 +29,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Union
@@ -314,11 +315,35 @@ class Host:
         if self.local:
             p = Path(path)
             p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = p.with_name(p.name + ".tmp-dshbridge")
-            tmp.write_bytes(data)
-            tmp.replace(p)
+            tmp = p.with_name(f".{p.name}.{uuid.uuid4().hex}.tmp-dshbridge")
+            try:
+                with tmp.open("xb") as fh:
+                    fh.write(data)
+                tmp.replace(p)
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
             return
-        self.run(f"cat > {shlex.quote(str(path))}", stdin=data)
+        p = PurePosixPath(path)
+        tmp = p.with_name(f".{p.name}.{uuid.uuid4().hex}.tmp-dshbridge")
+        qtmp = shlex.quote(str(tmp))
+        try:
+            # EOF can look like a successful cat after a truncated transfer.
+            # Check length and digest before exposing the final filename.
+            self.run(f"cat > {qtmp} && test "
+                     f'"$(wc -c < {qtmp})" -eq {len(data)}', stdin=data)
+            if self.digest(tmp) != md5_bytes(data):
+                raise HostError(f"临时文件校验失败，未替换正式文件：{path}")
+            self.run(f"mv -f -- {qtmp} {shlex.quote(str(p))}")
+        finally:
+            # Only this invocation's unique temporary file may be removed.
+            # If the device is unreachable it may remain for later inspection.
+            try:
+                self.run(f"rm -f -- {qtmp}")
+            except HostError:
+                pass
 
     def write_text(self, path: PathLike, text: str) -> None:
         self.write_bytes(path, text.encode("utf-8"))
